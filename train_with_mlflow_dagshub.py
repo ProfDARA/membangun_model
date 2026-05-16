@@ -38,6 +38,25 @@ try:
 except Exception:
     dagshub = None
 
+# Auto-load .env file from script directory if present (simple loader, no extra deps)
+env_path = Path(__file__).parent / '.env'
+if env_path.exists():
+    try:
+        for ln in env_path.read_text(encoding='utf-8').splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith('#'):
+                continue
+            if '=' in ln:
+                k, v = ln.split('=', 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                # do not overwrite existing environment variables
+                if k not in os.environ or not os.environ.get(k):
+                    os.environ[k] = v
+        print(f'Loaded env file: {env_path}')
+    except Exception as e:
+        print(f'Warning: failed to load {env_path}: {e}')
+
 
 def plot_feature_importances(importances, feature_names, out_path: Path):
     fig, ax = plt.subplots(figsize=(8, max(3, len(feature_names) * 0.3)))
@@ -181,7 +200,7 @@ def train_and_log(tracking_uri: str, experiment_name: str, output_dir: str, data
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tracking_uri', default=os.environ.get('MLFLOW_TRACKING_URI', 'sqlite:///mlruns.db'))
+    parser.add_argument('--tracking_uri', default=os.environ.get('MLFLOW_TRACKING_URI', 'https://dagshub.com/ProfDARA/membangun_model.mlflow'))
     parser.add_argument('--dagshub_owner', default=os.environ.get('DAGSHUB_OWNER'))
     parser.add_argument('--dagshub_repo', default=os.environ.get('DAGSHUB_REPO'))
     parser.add_argument('--data', dest='data', default=os.environ.get('DATA_CSV'),
