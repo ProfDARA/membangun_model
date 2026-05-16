@@ -1,0 +1,13 @@
+# DagsHub integration link
+
+# If you applied Advanced level tracking, put your repository MLflow URL here.
+# Example format:
+# https://dagshub.com/<owner>/<repo>.mlflow
+
+# Replace the line below with your DagsHub MLflow tracking URI:
+MLFLOW_DAGSHUB_URI=
+
+# Notes:
+# - Set this value in environment variable MLFLOW_TRACKING_URI or pass to the
+#   script `train_with_mlflow_dagshub.py --tracking_uri <uri>` when running.
+# - Ensure DagsHub auth token is configured per DagsHub documentation.
