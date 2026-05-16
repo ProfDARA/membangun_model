@@ -33,6 +33,10 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 
 # Import helper functions from modelling.py
 from Membangun_model.modelling import load_preprocessed_data, evaluate_regression
+try:
+    import dagshub
+except Exception:
+    dagshub = None
 
 
 def plot_feature_importances(importances, feature_names, out_path: Path):
@@ -57,12 +61,22 @@ def plot_residuals(y_true, y_pred, out_path: Path):
     plt.close(fig)
 
 
-def train_and_log(tracking_uri: str, experiment_name: str, output_dir: str):
+def train_and_log(tracking_uri: str, experiment_name: str, output_dir: str, data_path: str = None):
     os.makedirs(output_dir, exist_ok=True)
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(experiment_name)
 
-    X_train, X_val, X_test, y_train, y_val, y_test = load_preprocessed_data()
+    # Load data - allow overriding default path via `data_path` or env var
+    data_csv = data_path or os.environ.get('DATA_CSV')
+    try:
+        if data_csv:
+            X_train, X_val, X_test, y_train, y_val, y_test = load_preprocessed_data(data_csv)
+        else:
+            X_train, X_val, X_test, y_train, y_val, y_test = load_preprocessed_data()
+    except FileNotFoundError as e:
+        print("ERROR: dataset not found. Expected preprocessed CSV 'daily_sales_forecasting.csv'.")
+        print("Place your preprocessed file in one of the default locations or pass --data PATH to the script.")
+        raise
 
     models = {
         'random_forest': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
@@ -168,6 +182,10 @@ def train_and_log(tracking_uri: str, experiment_name: str, output_dir: str):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tracking_uri', default=os.environ.get('MLFLOW_TRACKING_URI', 'sqlite:///mlruns.db'))
+    parser.add_argument('--dagshub_owner', default=os.environ.get('DAGSHUB_OWNER'))
+    parser.add_argument('--dagshub_repo', default=os.environ.get('DAGSHUB_REPO'))
+    parser.add_argument('--data', dest='data', default=os.environ.get('DATA_CSV'),
+                        help='Path to preprocessed daily_sales_forecasting.csv (overrides default)')
     parser.add_argument('--experiment', default='Amazon_Daily_Revenue_Forecasting_Advanced')
     parser.add_argument('--output', default='Membangun_model/artifacts')
     return parser.parse_args()
@@ -175,5 +193,34 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    print(f"Using MLflow tracking URI: {args.tracking_uri}")
-    train_and_log(args.tracking_uri, args.experiment, args.output)
+    # If a DagsHub owner/repo and token are provided via env or args,
+    # build a DagsHub MLflow tracking URI with basic auth embedded for this session.
+    tracking_uri = args.tracking_uri
+    if (tracking_uri is None or tracking_uri.startswith('sqlite:///')) and (args.dagshub_owner and args.dagshub_repo):
+        token = os.environ.get('DAGSHUB_TOKEN')
+        user = os.environ.get('DAGSHUB_USER', args.dagshub_owner)
+        if token:
+            tracking_uri = f"https://{user}:{token}@dagshub.com/{args.dagshub_owner}/{args.dagshub_repo}.mlflow"
+            # export to env for MLflow clients
+            os.environ['MLFLOW_TRACKING_URI'] = tracking_uri
+            print("Built DagsHub tracking URI from env vars (using DAGSHUB_TOKEN).")
+            # initialize dagshub helper if available
+            try:
+                if dagshub is not None:
+                    dagshub.init(repo_owner=args.dagshub_owner, repo_name=args.dagshub_repo, mlflow=True)
+                    print(f"DagsHub initialized for {args.dagshub_owner}/{args.dagshub_repo}")
+                    # small integration test run to ensure MLflow logging to DagsHub works
+                    try:
+                        with mlflow.start_run():
+                            mlflow.log_param('parameter name', 'value')
+                            mlflow.log_metric('metric name', 1)
+                        print('Logged a test run to DagsHub via MLflow')
+                    except Exception as e:
+                        print(f'Warning: could not create test MLflow run on DagsHub: {e}')
+            except Exception as e:
+                print(f"Warning: dagshub.init failed: {e}")
+        else:
+            print("DAGSHUB_TOKEN not found in env; using provided --tracking_uri or default local sqlite.")
+
+    print(f"Using MLflow tracking URI: {tracking_uri}")
+    train_and_log(tracking_uri, args.experiment, args.output, data_path=args.data)

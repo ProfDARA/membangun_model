@@ -16,17 +16,25 @@ import os
 from pathlib import Path
 
 
-def load_preprocessed_data(daily_csv: str = 'Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_sales_forecasting.csv'):
+def load_preprocessed_data(daily_csv: str = 'Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv'):
     """
     Load cleaned daily sales forecasting CSV and perform time-based split.
 
     Tries multiple fallback locations and supports loading pre-split artifacts
     if present. If file(s) are missing, raises an informative error with next steps.
     """
+    # Resolve candidate paths relative to the repository root so scripts work
+    # whether run from repo root or from inside subfolders like Membangun_model.
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def _resolve(p):
+        p = Path(p)
+        return p if p.is_absolute() else (repo_root / p)
+
     candidates = [
-        Path(daily_csv),
-        Path('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_sales_forecasting.csv'),
-        Path('Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv')
+        _resolve(daily_csv),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv'),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_sales_forecasting.csv')
     ]
 
     df = None
@@ -44,7 +52,7 @@ def load_preprocessed_data(daily_csv: str = 'Eksperimen_SML_DanangAgungRestuAji/
             except Exception:
                 df = None
 
-    artifacts_dir = Path('Eksperimen_SML_DanangAgungRestuAji/preprocessing/preprocessing_artifacts')
+    artifacts_dir = repo_root / 'Eksperimen_SML_DanangAgungRestuAji' / 'preprocessing' / 'preprocessing_artifacts'
     if df is None and artifacts_dir.exists():
         x_train_path = artifacts_dir / 'X_train.csv'
         y_train_path = artifacts_dir / 'y_train.csv'

@@ -25,13 +25,59 @@ def load_preprocessed_data(daily_csv: str = 'Eksperimen_SML_DanangAgungRestuAji/
     Load the cleaned daily sales forecasting dataset and prepare
     train/validation/test splits for regression.
 
-    Args:
-        daily_csv: Path to `daily_sales_forecasting.csv` produced by preprocessing
-
-    Returns:
-        X_train, X_val, X_test, y_train, y_val, y_test (all pandas DataFrames/Series)
+    Resolves candidate paths relative to the repository root so the script
+    works whether executed from repo root or from inside `Membangun_model`.
     """
-    df = pd.read_csv(daily_csv, parse_dates=['Date'])
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def _resolve(p):
+        p = Path(p)
+        return p if p.is_absolute() else (repo_root / p)
+
+    candidates = [
+        _resolve(daily_csv),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_sales_ing.csv'),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv')
+    ]
+
+    df = None
+    for p in candidates:
+        try:
+            if p.exists():
+                df = pd.read_csv(p, parse_dates=['Date'])
+                print(f"Loaded daily CSV from: {p}")
+                break
+        except Exception:
+            try:
+                df = pd.read_csv(p)
+                print(f"Loaded daily CSV (no Date parse) from: {p}")
+                break
+            except Exception:
+                df = None
+
+    artifacts_dir = repo_root / 'Eksperimen_SML_DanangAgungRestuAji' / 'preprocessing' / 'preprocessing_artifacts'
+
+    if df is None and artifacts_dir.exists():
+        x_train_path = artifacts_dir / 'X_train.csv'
+        y_train_path = artifacts_dir / 'y_train.csv'
+        if x_train_path.exists() and y_train_path.exists():
+            X_train = pd.read_csv(x_train_path)
+            X_val = pd.read_csv(artifacts_dir / 'X_val.csv') if (artifacts_dir / 'X_val.csv').exists() else pd.DataFrame()
+            X_test = pd.read_csv(artifacts_dir / 'X_test.csv') if (artifacts_dir / 'X_test.csv').exists() else pd.DataFrame()
+            y_train = pd.read_csv(y_train_path).squeeze()
+            y_val = pd.read_csv(artifacts_dir / 'y_val.csv').squeeze() if (artifacts_dir / 'y_val.csv').exists() else pd.Series(dtype=float)
+            y_test = pd.read_csv(artifacts_dir / 'y_test.csv').squeeze() if (artifacts_dir / 'y_test.csv').exists() else pd.Series(dtype=float)
+
+            print(f"Loaded pre-split artifacts from: {artifacts_dir}")
+            return X_train, X_val, X_test, y_train, y_val, y_test
+
+    if df is None:
+        raise FileNotFoundError(
+            f"daily_sales_forecasting.csv not found. Tried: {[str(p) for p in candidates]}\n"
+            "Please run preprocessing to generate it:\n"
+            "  cd Eksperimen_SML_DanangAgungRestuAji/preprocessing\n"
+            "  python automate_DanangAgungRestuAji.py\n"
+        )
 
     # Ensure expected features exist
     expected_features = [
@@ -41,7 +87,63 @@ def load_preprocessed_data(daily_csv: str = 'Eksperimen_SML_DanangAgungRestuAji/
 
     available = [c for c in expected_features if c in df.columns]
     if len(available) < 3:
-        raise ValueError(f"Not enough feature columns found in {daily_csv}. Available: {available}")
+        # Attempt to engineer features from cleaned raw data (if possible)
+        try:
+            if 'Date' in df.columns:
+                # Aggregate to daily revenue if raw sales exist
+                if 'Amount' in df.columns or 'Daily_Revenue' not in df.columns:
+                    if 'Daily_Revenue' in df.columns:
+                        daily = df.copy()
+                        daily['Date'] = pd.to_datetime(daily['Date'])
+                        daily = daily.sort_values('Date')
+                        daily = daily.set_index('Date')
+                    else:
+                        tmp = df.copy()
+                        tmp['Date'] = pd.to_datetime(tmp['Date'])
+                        daily = tmp.groupby('Date', as_index=True).agg({'Amount': 'sum'})
+                        daily = daily.rename(columns={'Amount': 'Daily_Revenue'})
+
+                    daily = daily.asfreq('D', fill_value=0)
+
+                    daily['lag_1'] = daily['Daily_Revenue'].shift(1)
+                    daily['lag_7'] = daily['Daily_Revenue'].shift(7)
+                    daily['rolling_mean_7'] = daily['Daily_Revenue'].rolling(window=7).mean()
+                    daily['rolling_std_7'] = daily['Daily_Revenue'].rolling(window=7).std()
+                    daily['day'] = daily.index.day
+                    daily['month'] = daily.index.month
+                    daily['year'] = daily.index.year
+                    daily['weekday'] = daily.index.weekday
+                    try:
+                        daily['weekofyear'] = daily.index.isocalendar().week
+                    except Exception:
+                        daily['weekofyear'] = daily.index.week
+
+                    daily = daily.dropna().reset_index()
+
+                    feature_cols = [c for c in expected_features if c in daily.columns]
+                    if len(feature_cols) < 3:
+                        raise ValueError(f"Feature engineering produced insufficient features. Available: {feature_cols}")
+
+                    X = daily[feature_cols]
+                    y = daily['Daily_Revenue']
+
+                    n = len(daily)
+                    n_train = int(n * 0.7)
+                    n_val = int(n * 0.15)
+
+                    X_train = X.iloc[:n_train].reset_index(drop=True)
+                    y_train = y.iloc[:n_train].reset_index(drop=True)
+
+                    X_val = X.iloc[n_train:n_train + n_val].reset_index(drop=True)
+                    y_val = y.iloc[n_train:n_train + n_val].reset_index(drop=True)
+
+                    X_test = X.iloc[n_train + n_val:].reset_index(drop=True)
+                    y_test = y.iloc[n_train + n_val:].reset_index(drop=True)
+
+                    print(f"Engineered features from cleaned data: total={n}, train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
+                    return X_train, X_val, X_test, y_train, y_val, y_test
+        except Exception as e:
+            raise ValueError(f"Not enough feature columns found in {daily_csv}. Available: {available}. Feature engineering failed: {e}")
 
     df = df.dropna().sort_values('Date')
 
@@ -112,7 +214,7 @@ def hyperparameter_tuning_random_forest(X_train, y_train, X_val, y_val, X_test, 
         'max_depth': [5, 10, 15, None],
         'min_samples_split': [2, 5, 10],
         'min_samples_leaf': [1, 2, 4],
-        'max_features': ['sqrt', 'auto']
+        'max_features': ['sqrt', 'log2', None]
     }
 
     rf_base = RandomForestRegressor(random_state=42, n_jobs=-1)
@@ -338,10 +440,10 @@ def main():
     
     print("\nKriteria 2 - Skilled Level (3 Poin) Complete!")
     print("Features:")
-    print("  ✓ Hyperparameter tuning dengan RandomizedSearchCV")
-    print("  ✓ Manual logging di MLflow (tidak autolog)")
-    print("  ✓ Metrik regresi: MAE, RMSE, R2, MAPE")
-    print("  ✓ Comparison antara RandomForestRegressor dan GradientBoostingRegressor")
+    print("  - Hyperparameter tuning dengan RandomizedSearchCV")
+    print("  - Manual logging di MLflow (tidak autolog)")
+    print("  - Metrik regresi: MAE, RMSE, R2, MAPE")
+    print("  - Comparison antara RandomForestRegressor dan GradientBoostingRegressor")
     print("\nMLflow Tracking UI: mlflow ui --backend-store-uri sqlite:///mlruns.db")
 
 
