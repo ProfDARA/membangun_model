@@ -1,5 +1,5 @@
 """
-Model Training with Hyperparameter Tuning - Kriteria 2: Skilled Level (3 Poin)
+Demand Forecasting with Hyperparameter Tuning - Kriteria 2: Skilled Level (3 Poin)
 Uses MLflow Tracking UI (local) with MANUAL logging (not autolog)
 Includes hyperparameter tuning and additional metrics
 Author: Danang Agung Restu Aji
@@ -8,8 +8,9 @@ Author: Danang Agung Restu Aji
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import LabelEncoder
 import mlflow
 import mlflow.sklearn
 try:
@@ -20,251 +21,273 @@ import pickle
 import os
 import json
 from pathlib import Path
+from typing import cast, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
 
 
-def load_preprocessed_data(daily_csv: str = 'Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_sales_forecasting.csv', force_aggregation: str = None):
-    """
-    Flexible loader adapted to new preprocessing outputs (Amount, Year/Month, *_encoded).
-    Produces X_train, X_val, X_test, y_train, y_val, y_test.
-    """
+def _resolve_csv_path(csv_path: str) -> Path:
     repo_root = Path(__file__).resolve().parents[1]
 
-    def _resolve(p):
+    def _resolve(p: str) -> Path:
         p = Path(p)
         return p if p.is_absolute() else (repo_root / p)
 
     candidates = [
-        _resolve(daily_csv),
-        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_sales_ing.csv'),
-        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv')
+        _resolve(csv_path),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv'),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_demand_forecasting.csv'),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_demand_by_sku.csv'),
+        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_demand_by_state.csv')
     ]
 
-    df = None
     for p in candidates:
-        try:
-            if p.exists():
-                try:
-                    df = pd.read_csv(p, parse_dates=['Date'])
-                except Exception:
-                    df = pd.read_csv(p)
-                print(f"Loaded CSV from: {p}")
-                break
-        except Exception:
-            continue
+        if p.exists():
+            return p
 
-    artifacts_dir = repo_root / 'Eksperimen_SML_DanangAgungRestuAji' / 'preprocessing' / 'preprocessing_artifacts'
-    if df is None and artifacts_dir.exists():
-        x_train_path = artifacts_dir / 'X_train.csv'
-        y_train_path = artifacts_dir / 'y_train.csv'
-        if x_train_path.exists() and y_train_path.exists():
-            X_train = pd.read_csv(x_train_path)
-            X_val = pd.read_csv(artifacts_dir / 'X_val.csv') if (artifacts_dir / 'X_val.csv').exists() else pd.DataFrame()
-            X_test = pd.read_csv(artifacts_dir / 'X_test.csv') if (artifacts_dir / 'X_test.csv').exists() else pd.DataFrame()
-            y_train = pd.read_csv(y_train_path).squeeze()
-            y_val = pd.read_csv(artifacts_dir / 'y_val.csv').squeeze() if (artifacts_dir / 'y_val.csv').exists() else pd.Series(dtype=float)
-            y_test = pd.read_csv(artifacts_dir / 'y_test.csv').squeeze() if (artifacts_dir / 'y_test.csv').exists() else pd.Series(dtype=float)
+    raise FileNotFoundError(
+        "Sales CSV not found. Please run preprocessing to generate it or place it in the preprocessing folder."
+    )
 
-            print(f"Loaded pre-split artifacts from: {artifacts_dir}")
-            return X_train, X_val, X_test, y_train, y_val, y_test
 
-    if df is None:
-        raise FileNotFoundError(f"Sales CSV not found. Tried: {[str(p) for p in candidates]}")
+def load_sales_data(csv_path: str) -> pd.DataFrame:
+    path = _resolve_csv_path(csv_path)
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read CSV: {path}") from exc
 
-    # Normalize column names
     df.columns = [c.strip() for c in df.columns]
+    print(f"Loaded CSV from: {path}")
+    return df
 
-    # If force_aggregation == 'daily', prefer aggregating Amount -> Daily_Revenue
-    if force_aggregation == 'daily':
-        if 'Date' in df.columns and 'Amount' in df.columns:
-            tmp = df.copy()
-            tmp['Date'] = pd.to_datetime(tmp['Date'])
-            daily = tmp.groupby('Date', as_index=True).agg({'Amount': 'sum'}).rename(columns={'Amount':'Daily_Revenue'})
-            # remove zero-revenue days introduced by sparse data
-            nonzero_before = len(daily)
-            daily = daily[daily['Daily_Revenue'] != 0]
-            nonzero_after = len(daily)
-            print(f"Removed zero-revenue days after aggregation: {nonzero_before - nonzero_after}")
-            daily['lag_1'] = daily['Daily_Revenue'].shift(1)
-            daily['lag_7'] = daily['Daily_Revenue'].shift(7)
-            daily['rolling_mean_7'] = daily['Daily_Revenue'].rolling(window=7).mean()
-            daily['rolling_std_7'] = daily['Daily_Revenue'].rolling(window=7).std()
-            daily['day'] = daily.index.day
-            daily['month'] = daily.index.month
-            daily['year'] = daily.index.year
-            daily['weekday'] = daily.index.weekday
-            try:
-                daily['weekofyear'] = daily.index.isocalendar().week
-            except Exception:
-                daily['weekofyear'] = daily.index.week
-            daily = daily.dropna().reset_index()
-            feature_cols = [c for c in ['lag_1','lag_7','rolling_mean_7','rolling_std_7','day','month','year','weekday','weekofyear'] if c in daily.columns]
-            X = daily[feature_cols]
-            y = daily['Daily_Revenue']
-            n = len(daily)
-            n_train = int(n * 0.7)
-            n_val = int(n * 0.15)
-            X_train = X.iloc[:n_train].reset_index(drop=True)
-            y_train = y.iloc[:n_train].reset_index(drop=True)
-            X_val = X.iloc[n_train:n_train + n_val].reset_index(drop=True)
-            y_val = y.iloc[n_train:n_train + n_val].reset_index(drop=True)
-            X_test = X.iloc[n_train + n_val:].reset_index(drop=True)
-            y_test = y.iloc[n_train + n_val:].reset_index(drop=True)
-            print(f"Force-aggregated daily revenue: total={n}, train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-            return X_train, X_val, X_test, y_train, y_val, y_test
-        else:
-            pass
 
-    # If Daily_Revenue present and Date exists, use it
-    if 'Daily_Revenue' in df.columns and 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date').dropna()
-        # remove zero-revenue rows
-        nonzero_before = len(df)
-        df = df[df['Daily_Revenue'] != 0]
-        nonzero_after = len(df)
-        print(f"Removed zero-revenue rows: {nonzero_before - nonzero_after}")
-        feature_cols = [c for c in df.columns if c.endswith('_encoded') or c in ['lag_1','lag_7','rolling_mean_7','rolling_std_7','day','month','year','weekday','weekofyear']]
-        X = df[[c for c in feature_cols if c in df.columns]]
-        y = df['Daily_Revenue']
-        n = len(df)
-        if n < 10:
-            raise ValueError("After removing zero-revenue rows there are too few samples for modeling.")
-        n_train = int(n * 0.7)
-        n_val = int(n * 0.15)
+def _normalize_group_value(value: str) -> str:
+    return str(value).strip().lower()
 
-        X_train = X.iloc[:n_train].reset_index(drop=True)
-        y_train = y.iloc[:n_train].reset_index(drop=True)
-        X_val = X.iloc[n_train:n_train + n_val].reset_index(drop=True)
-        y_val = y.iloc[n_train:n_train + n_val].reset_index(drop=True)
-        X_test = X.iloc[n_train + n_val:].reset_index(drop=True)
-        y_test = y.iloc[n_train + n_val:].reset_index(drop=True)
 
-        print(f"Loaded Daily_Revenue dataset: total={n}, train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-        return X_train, X_val, X_test, y_train, y_val, y_test
+def build_grouped_demand_dataset(
+    df: pd.DataFrame,
+    group_col: str,
+    group_value: Optional[str] = None,
+    date_col: str = 'Date',
+    target_col: str = 'Qty',
+    min_group_size: int = 30,
+    fill_missing_dates: bool = True
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    if date_col not in df.columns:
+        raise ValueError(f"Missing date column: {date_col}")
+    if group_col not in df.columns:
+        raise ValueError(f"Missing group column: {group_col}")
+    if target_col not in df.columns:
+        raise ValueError(f"Missing target column: {target_col}")
 
-    # If Date and Amount present, aggregate to daily revenue
-    if 'Date' in df.columns and 'Amount' in df.columns:
-        tmp = df.copy()
-        tmp['Date'] = pd.to_datetime(tmp['Date'])
-        daily = tmp.groupby('Date', as_index=True).agg({'Amount': 'sum'}).rename(columns={'Amount':'Daily_Revenue'})
-        # remove zero-revenue days introduced by sparse data
-        nonzero_before = len(daily)
-        daily = daily[daily['Daily_Revenue'] != 0]
-        nonzero_after = len(daily)
-        print(f"Removed zero-revenue days after aggregation: {nonzero_before - nonzero_after}")
-        daily['lag_1'] = daily['Daily_Revenue'].shift(1)
-        daily['lag_7'] = daily['Daily_Revenue'].shift(7)
-        daily['rolling_mean_7'] = daily['Daily_Revenue'].rolling(window=7).mean()
-        daily['rolling_std_7'] = daily['Daily_Revenue'].rolling(window=7).std()
-        daily['day'] = daily.index.day
-        daily['month'] = daily.index.month
-        daily['year'] = daily.index.year
-        daily['weekday'] = daily.index.weekday
-        try:
-            daily['weekofyear'] = daily.index.isocalendar().week
-        except Exception:
-            daily['weekofyear'] = daily.index.week
-        daily = daily.dropna().reset_index()
-        if len(daily) < 10:
-            raise ValueError("After removing zero-revenue days there are too few samples for modeling. Consider different aggregation or keep zeros.")
+    work = df[[date_col, group_col, target_col]].copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors='coerce')
+    work[target_col] = pd.to_numeric(work[target_col], errors='coerce')
+    work[group_col] = work[group_col].astype(str).str.strip()
+    work = work.dropna(subset=[date_col, group_col, target_col])
 
-        feature_cols = [c for c in ['lag_1','lag_7','rolling_mean_7','rolling_std_7','day','month','year','weekday','weekofyear'] if c in daily.columns]
-        X = daily[feature_cols]
-        y = daily['Daily_Revenue']
-        n = len(daily)
-        n_train = int(n * 0.7)
-        n_val = int(n * 0.15)
+    if group_value:
+        target_norm = _normalize_group_value(group_value)
+        group_norm = work[group_col].str.strip().str.lower()
+        work = work[group_norm == target_norm]
+        if work.empty:
+            sample_groups = (
+                df[group_col]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .unique()
+                .tolist()[:10]
+            )
+            raise ValueError(
+                f"No rows found for {group_col}='{group_value}'. Sample values: {sample_groups}"
+            )
 
-        X_train = X.iloc[:n_train].reset_index(drop=True)
-        y_train = y.iloc[:n_train].reset_index(drop=True)
-        X_val = X.iloc[n_train:n_train + n_val].reset_index(drop=True)
-        y_val = y.iloc[n_train:n_train + n_val].reset_index(drop=True)
-        X_test = X.iloc[n_train + n_val:].reset_index(drop=True)
-        y_test = y.iloc[n_train + n_val:].reset_index(drop=True)
+    daily = (
+        work.groupby([date_col, group_col], as_index=False)[target_col]
+        .sum()
+        .rename(columns={target_col: 'Daily_Demand'})
+    )
 
-        print(f"Aggregated daily revenue from Amount: total={n}, train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-        return X_train, X_val, X_test, y_train, y_val, y_test
+    if fill_missing_dates:
+        frames = []
+        for g, gdf in daily.groupby(group_col):
+            full_idx = pd.date_range(gdf[date_col].min(), gdf[date_col].max(), freq='D')
+            gdf = gdf.set_index(date_col).reindex(full_idx)
+            gdf.index.name = date_col
+            gdf[group_col] = g
+            gdf['Daily_Demand'] = gdf['Daily_Demand'].fillna(0)
+            frames.append(gdf.reset_index())
+        daily = pd.concat(frames, ignore_index=True)
 
-    # If Year/Month present, try to construct Date then aggregate
-    if 'Amount' in df.columns and 'Year' in df.columns and 'Month' in df.columns:
-        tmp = df.copy()
-        if 'Day' in tmp.columns:
-            try:
-                tmp['Date'] = pd.to_datetime(tmp[['Year','Month','Day']])
-            except Exception:
-                tmp['Date'] = pd.to_datetime(tmp['Year'].astype(int).astype(str) + '-' + tmp['Month'].astype(int).astype(str) + '-01')
-        else:
-            tmp['Date'] = pd.to_datetime(tmp['Year'].astype(int).astype(str) + '-' + tmp['Month'].astype(int).astype(str) + '-01')
+    if not group_value:
+        group_counts = daily.groupby(group_col).size().sort_values(ascending=False)
+        keep_groups = group_counts[group_counts >= min_group_size].index
+        daily = daily[daily[group_col].isin(keep_groups)]
 
-        daily = tmp.groupby('Date', as_index=True).agg({'Amount': 'sum'}).rename(columns={'Amount':'Daily_Revenue'})
-        # remove zero-revenue days introduced by sparse data
-        nonzero_before = len(daily)
-        daily = daily[daily['Daily_Revenue'] != 0]
-        nonzero_after = len(daily)
-        print(f"Removed zero-revenue days after aggregation: {nonzero_before - nonzero_after}")
-        daily['lag_1'] = daily['Daily_Revenue'].shift(1)
-        daily['lag_7'] = daily['Daily_Revenue'].shift(7)
-        daily['rolling_mean_7'] = daily['Daily_Revenue'].rolling(window=7).mean()
-        daily['rolling_std_7'] = daily['Daily_Revenue'].rolling(window=7).std()
-        daily['day'] = daily.index.day
-        daily['month'] = daily.index.month
-        daily['year'] = daily.index.year
-        daily['weekday'] = daily.index.weekday
-        try:
-            daily['weekofyear'] = daily.index.isocalendar().week
-        except Exception:
-            daily['weekofyear'] = daily.index.week
-        daily = daily.dropna().reset_index()
+    if daily.empty:
+        raise ValueError("No rows available after aggregation. Check group filters or min_group_size.")
 
-        feature_cols = [c for c in ['lag_1','lag_7','rolling_mean_7','rolling_std_7','day','month','year','weekday','weekofyear'] if c in daily.columns]
-        X = daily[feature_cols]
-        y = daily['Daily_Revenue']
-        n = len(daily)
-        n_train = int(n * 0.7)
-        n_val = int(n * 0.15)
+    daily = daily.sort_values([group_col, date_col])
+    daily['lag_1'] = daily.groupby(group_col)['Daily_Demand'].shift(1)
+    daily['lag_7'] = daily.groupby(group_col)['Daily_Demand'].shift(7)
+    daily['lag_14'] = daily.groupby(group_col)['Daily_Demand'].shift(14)
+    daily['rolling_mean_7'] = daily.groupby(group_col)['Daily_Demand'].transform(
+        lambda s: s.shift(1).rolling(window=7).mean()
+    )
+    daily['rolling_std_7'] = daily.groupby(group_col)['Daily_Demand'].transform(
+        lambda s: s.shift(1).rolling(window=7).std()
+    )
+    daily['rolling_mean_30'] = daily.groupby(group_col)['Daily_Demand'].transform(
+        lambda s: s.shift(1).rolling(window=30).mean()
+    )
+    daily['rolling_std_30'] = daily.groupby(group_col)['Daily_Demand'].transform(
+        lambda s: s.shift(1).rolling(window=30).std()
+    )
 
-        X_train = X.iloc[:n_train].reset_index(drop=True)
-        y_train = y.iloc[:n_train].reset_index(drop=True)
-        X_val = X.iloc[n_train:n_train + n_val].reset_index(drop=True)
-        y_val = y.iloc[n_train:n_train + n_val].reset_index(drop=True)
-        X_test = X.iloc[n_train + n_val:].reset_index(drop=True)
-        y_test = y.iloc[n_train + n_val:].reset_index(drop=True)
+    daily['day'] = daily[date_col].dt.day
+    daily['month'] = daily[date_col].dt.month
+    daily['year'] = daily[date_col].dt.year
+    daily['weekday'] = daily[date_col].dt.weekday
+    daily['weekofyear'] = daily[date_col].dt.isocalendar().week.astype(int)
+    daily['is_weekend'] = (daily['weekday'] >= 5).astype(int)
 
-        print(f"Constructed date from Year/Month and aggregated: total={n}, train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-        return X_train, X_val, X_test, y_train, y_val, y_test
+    daily = daily.dropna().reset_index(drop=True)
 
-    # Fallback: per-order modeling using Amount (random split)
-    if 'Amount' in df.columns:
-        df2 = df.copy()
-        # automatic numeric feature selection (include encoded)
-        feature_cols = [c for c in df2.columns if c.endswith('_encoded') or df2[c].dtype.kind in 'biufc' and c != 'Amount']
-        if not feature_cols:
-            for c in ['Year','Month','DayOfWeek','Qty','B2B']:
-                if c in df2.columns:
-                    feature_cols.append(c)
-        X = df2[feature_cols].fillna(0)
-        y = df2['Amount']
-        X_train, X_temp, y_train, y_temp = train_test_split(X, y, train_size=0.7, random_state=42)
-        X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+    cat = daily[group_col].astype('category')
+    daily['group_id'] = cat.cat.codes
+    group_mapping = {str(name): int(idx) for idx, name in enumerate(cat.cat.categories)}
 
-        print(f"Fallback per-order modeling using Amount: total={len(X)}, train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-        return X_train.reset_index(drop=True), X_val.reset_index(drop=True), X_test.reset_index(drop=True), y_train.reset_index(drop=True), y_val.reset_index(drop=True), y_test.reset_index(drop=True)
+    return daily, group_mapping
 
-    raise ValueError("Unable to prepare features/target from provided CSV. Ensure it contains 'Amount'/'Date' or precomputed 'Daily_Revenue'.")
+
+def time_based_split(
+    df: pd.DataFrame,
+    date_col: str = 'Date',
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    unique_dates = sorted(df[date_col].unique())
+    if len(unique_dates) < 3:
+        raise ValueError("Not enough unique dates for time-based split.")
+
+    n_dates = len(unique_dates)
+    train_cut = max(1, int(n_dates * train_ratio))
+    val_cut = max(train_cut + 1, int(n_dates * (train_ratio + val_ratio)))
+
+    train_end = unique_dates[train_cut - 1]
+    val_end = unique_dates[min(val_cut - 1, n_dates - 1)]
+
+    train_df = df[df[date_col] <= train_end].copy()
+    val_df = df[(df[date_col] > train_end) & (df[date_col] <= val_end)].copy()
+    test_df = df[df[date_col] > val_end].copy()
+
+    return train_df, val_df, test_df
+
+
+def prepare_train_data(
+    csv_path: str,
+    group_col: str,
+    group_value: Optional[str] = None,
+    date_col: str = 'Date',
+    target_col: str = 'Qty',
+    min_group_size: int = 30,
+    fill_missing_dates: bool = True
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series, Dict[str, int]]:
+    df = load_sales_data(csv_path)
+    dataset, group_mapping = build_grouped_demand_dataset(
+        df,
+        group_col=group_col,
+        group_value=group_value,
+        date_col=date_col,
+        target_col=target_col,
+        min_group_size=min_group_size,
+        fill_missing_dates=fill_missing_dates
+    )
+
+    train_df, val_df, test_df = time_based_split(dataset, date_col=date_col)
+    include_group = dataset[group_col].nunique() > 1
+    feature_cols = [
+        'lag_1', 'lag_7', 'lag_14',
+        'rolling_mean_7', 'rolling_std_7',
+        'rolling_mean_30', 'rolling_std_30',
+        'day', 'month', 'year', 'weekday', 'weekofyear', 'is_weekend'
+    ]
+    if include_group:
+        feature_cols.append('group_id')
+
+    X_train = train_df[feature_cols]
+    y_train = train_df['Daily_Demand']
+    X_val = val_df[feature_cols]
+    y_val = val_df['Daily_Demand']
+    X_test = test_df[feature_cols]
+    y_test = test_df['Daily_Demand']
+
+    print(
+        f"Prepared demand dataset: total={len(dataset)}, train={len(X_train)}, "
+        f"val={len(X_val)}, test={len(X_test)}, groups={dataset[group_col].nunique()}"
+    )
+
+    return X_train, X_val, X_test, y_train, y_val, y_test, group_mapping
+
+
+def encode_categorical_columns(df):
+    df = df.copy()
+
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = LabelEncoder().fit_transform(df[col].astype(str))
+
+    return df
 
 
 def _clean_X_for_model(X):
-    """Return numeric-only dataframe and drop any target-like columns."""
+    """Encode object columns, drop target-like columns, and return a numeric dataframe."""
     Xc = X.copy()
-    for tcol in ['Daily_Revenue', 'Amount']:
+    for tcol in ['Daily_Revenue', 'Daily_Demand', 'Amount']:
         if tcol in Xc.columns:
             Xc = Xc.drop(columns=[tcol])
-    # keep numeric types only
-    Xc = Xc.select_dtypes(include=[np.number]).fillna(0)
+    for col in Xc.select_dtypes(include=['object']).columns:
+        Xc[col] = LabelEncoder().fit_transform(Xc[col].astype(str))
+    Xc = Xc.fillna(0)
     return Xc
+
+
+def _prepare_tuning_data(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Clean tuning inputs and choose the largest non-empty training set available."""
+    X_train_c = _clean_X_for_model(X_train)
+    X_val_c = _clean_X_for_model(X_val)
+
+    if len(X_train_c) == 0 and len(X_val_c) == 0:
+        raise ValueError(
+            "No training rows available for hyperparameter tuning after feature cleaning. "
+            "Check the preprocessing output or the selected dataset path."
+        )
+
+    if len(X_val_c) == 0:
+        X_combined = X_train_c.reset_index(drop=True)
+        y_combined: pd.Series = pd.to_numeric(y_train, errors='coerce').reset_index(drop=True)
+    else:
+        X_combined = pd.concat([X_train_c, X_val_c], ignore_index=True)
+        y_combined = pd.concat([y_train, y_val], ignore_index=True)
+        y_combined = pd.to_numeric(y_combined, errors='coerce')
+
+    valid_mask = y_combined.notna()
+    X_combined = X_combined.loc[valid_mask].reset_index(drop=True)
+    y_combined = y_combined.loc[valid_mask].reset_index(drop=True)
+
+    if len(X_combined) == 0:
+        raise ValueError(
+            "Training targets became empty after numeric conversion. Check the target column values."
+        )
+
+    return X_combined, y_combined
 
 
 def evaluate_regression(y_true, y_pred, dataset_name: str = ""):
@@ -319,26 +342,31 @@ def hyperparameter_tuning_random_forest(X_train, y_train, X_val, y_val, X_test, 
     }
 
     rf_base = RandomForestRegressor(random_state=42, n_jobs=-1)
-    grid_search = RandomizedSearchCV(
-        rf_base, param_grid, n_iter=20, cv=3, n_jobs=-1,
-        scoring='neg_mean_squared_error', verbose=1, random_state=42
-    )
-
-    # Clean features (drop target-like columns, numeric-only)
     X_train_c = _clean_X_for_model(X_train)
-    X_val_c = _clean_X_for_model(X_val)
     X_test_c = _clean_X_for_model(X_test)
 
-    X_combined = pd.concat([X_train_c, X_val_c])
-    y_combined = pd.concat([y_train, y_val])
+    X_combined, y_combined = _prepare_tuning_data(X_train, y_train, X_val, y_val)
+    cv_splits = min(3, len(X_combined) - 1)
+    if cv_splits < 2:
+        print("Not enough rows for cross-validation; fitting Random Forest with default parameters instead.")
+        best_model = rf_base.fit(X_combined, y_combined)
+        y_train_pred = best_model.predict(X_train_c) if len(X_train_c) > 0 else np.array([])
+        y_test_pred = best_model.predict(X_test_c) if len(X_test_c) > 0 else np.array([])
+        train_metrics = evaluate_regression(y_train, y_train_pred, "TRAINING - Tuned RF")
+        test_metrics = evaluate_regression(y_test, y_test_pred, "TEST - Tuned RF")
+        return best_model, None, train_metrics, test_metrics
 
-    # Ensure target numeric
-    y_combined = pd.to_numeric(y_combined, errors='coerce')
+    tscv = TimeSeriesSplit(n_splits=cv_splits)
+
+    grid_search = RandomizedSearchCV(
+        rf_base, param_grid, n_iter=20, cv=tscv, n_jobs=-1,
+        scoring='neg_mean_squared_error', verbose=1, random_state=42
+    )
 
     print("Running hyperparameter tuning (20 iterations)...")
     grid_search.fit(X_combined, y_combined)
 
-    best_model = grid_search.best_estimator_
+    best_model = cast(RandomForestRegressor, grid_search.best_estimator_)
 
     print(f"\nBest parameters: {grid_search.best_params_}")
     print(f"Best CV score (neg MSE): {grid_search.best_score_:.4f}")
@@ -371,23 +399,31 @@ def hyperparameter_tuning_gradient_boosting(X_train, y_train, X_val, y_val, X_te
     }
 
     gb_base = GradientBoostingRegressor(random_state=42)
-    grid_search = RandomizedSearchCV(
-        gb_base, param_grid, n_iter=20, cv=3, n_jobs=-1,
-        scoring='neg_mean_squared_error', verbose=1, random_state=42
-    )
-
     X_train_c = _clean_X_for_model(X_train)
-    X_val_c = _clean_X_for_model(X_val)
     X_test_c = _clean_X_for_model(X_test)
 
-    X_combined = pd.concat([X_train_c, X_val_c])
-    y_combined = pd.concat([y_train, y_val])
-    y_combined = pd.to_numeric(y_combined, errors='coerce')
+    X_combined, y_combined = _prepare_tuning_data(X_train, y_train, X_val, y_val)
+    cv_splits = min(3, len(X_combined) - 1)
+    if cv_splits < 2:
+        print("Not enough rows for cross-validation; fitting Gradient Boosting with default parameters instead.")
+        best_model = gb_base.fit(X_combined, y_combined)
+        y_train_pred = best_model.predict(X_train_c) if len(X_train_c) > 0 else np.array([])
+        y_test_pred = best_model.predict(X_test_c) if len(X_test_c) > 0 else np.array([])
+        train_metrics = evaluate_regression(y_train, y_train_pred, "TRAINING - Tuned GB")
+        test_metrics = evaluate_regression(y_test, y_test_pred, "TEST - Tuned GB")
+        return best_model, None, train_metrics, test_metrics
+
+    tscv = TimeSeriesSplit(n_splits=cv_splits)
+
+    grid_search = RandomizedSearchCV(
+        gb_base, param_grid, n_iter=20, cv=tscv, n_jobs=-1,
+        scoring='neg_mean_squared_error', verbose=1, random_state=42
+    )
 
     print("Running hyperparameter tuning (20 iterations)...")
     grid_search.fit(X_combined, y_combined)
 
-    best_model = grid_search.best_estimator_
+    best_model = cast(GradientBoostingRegressor, grid_search.best_estimator_)
 
     print(f"\nBest parameters: {grid_search.best_params_}")
     print(f"Best CV score (neg MSE): {grid_search.best_score_:.4f}")
@@ -403,8 +439,16 @@ def hyperparameter_tuning_gradient_boosting(X_train, y_train, X_val, y_val, X_te
     return best_model, grid_search, train_metrics, test_metrics
 
 
-def train_with_mlflow_manual_logging(X_train, X_val, X_test, y_train, y_val, y_test,
-                                     output_dir: str = 'Membangun_model/artifacts'):
+def train_with_mlflow_manual_logging(
+    X_train,
+    X_val,
+    X_test,
+    y_train,
+    y_val,
+    y_test,
+    output_dir: str = 'Membangun_model/artifacts',
+    metadata: Optional[Dict[str, object]] = None
+):
     """
     Train models with MLflow manual logging (NOT autolog)
     Includes hyperparameter tuning for Skilled level (3 poin)
@@ -427,7 +471,8 @@ def train_with_mlflow_manual_logging(X_train, X_val, X_test, y_train, y_val, y_t
 
     # Set MLflow tracking URI to DagsHub
     mlflow.set_tracking_uri("https://dagshub.com/ProfDARA/membangun_model.mlflow")
-    mlflow.set_experiment("Amazon_Daily_Revenue_Forecasting_Tuning")
+    group_col = metadata.get('group_col') if metadata else 'Group'
+    mlflow.set_experiment(f"Amazon_Demand_Forecasting_Tuning_{group_col}")
     
     print("\n" + "=" * 80)
     print("KRITERIA 2: MODEL BUILDING - SKILLED LEVEL (3 Poin)")
@@ -460,19 +505,28 @@ def train_with_mlflow_manual_logging(X_train, X_val, X_test, y_train, y_val, y_t
     
     # ========== RANDOM FOREST TUNING ==========
     with mlflow.start_run(run_name="rf_tuned"):
+        X_test_c = _clean_X_for_model(X_test)
         rf_model, rf_grid, rf_train_metrics, rf_test_metrics = hyperparameter_tuning_random_forest(
             X_train, y_train, X_val, y_val, X_test, y_test, output_dir
         )
 
         # MANUAL LOGGING (instead of autolog)
-        mlflow.log_params({
+        params = {
             'model_type': 'RandomForestRegressor',
             'n_estimators': int(getattr(rf_model, 'n_estimators', 0)),
-            'max_depth': str(getattr(rf_model, 'max_depth', None))
-        })
+            'max_depth': str(getattr(rf_model, 'max_depth', None)),
+            'group_col': metadata.get('group_col') if metadata else None,
+            'group_value': metadata.get('group_value') if metadata else None,
+            'target_name': metadata.get('target_name') if metadata else None,
+            'n_groups': metadata.get('n_groups') if metadata else None
+        }
+        params = {k: (str(v) if v is not None else 'None') for k, v in params.items()}
+        mlflow.log_params(params)
 
         # Log tuning results (best params + compact cv summary)
         try:
+            if rf_grid is None:
+                raise ValueError("Random Forest tuning did not run CV; skipping CV summary logging.")
             best_params = rf_grid.best_params_
             mlflow.log_params({'rf_best_'+k: str(v) for k, v in best_params.items()})
             # Create compact CV results summary
@@ -529,7 +583,7 @@ def train_with_mlflow_manual_logging(X_train, X_val, X_test, y_train, y_val, y_t
             pass
 
         try:
-            y_test_pred = rf_model.predict(X_test)
+            y_test_pred = rf_model.predict(X_test_c)
             residuals = y_test - y_test_pred
             fig, ax = plt.subplots(figsize=(6, 4))
             sns.scatterplot(x=y_test_pred, y=residuals, alpha=0.5)
@@ -556,16 +610,23 @@ def train_with_mlflow_manual_logging(X_train, X_val, X_test, y_train, y_val, y_t
     
     # ========== GRADIENT BOOSTING TUNING ==========
     with mlflow.start_run(run_name="gb_tuned"):
+        X_test_c = _clean_X_for_model(X_test)
         gb_model, gb_grid, gb_train_metrics, gb_test_metrics = hyperparameter_tuning_gradient_boosting(
             X_train, y_train, X_val, y_val, X_test, y_test, output_dir
         )
 
         # MANUAL LOGGING
-        mlflow.log_params({
+        params = {
             'model_type': 'GradientBoostingRegressor',
             'n_estimators': int(getattr(gb_model, 'n_estimators', 0)),
             'learning_rate': float(getattr(gb_model, 'learning_rate', 0.0)),
-        })
+            'group_col': metadata.get('group_col') if metadata else None,
+            'group_value': metadata.get('group_value') if metadata else None,
+            'target_name': metadata.get('target_name') if metadata else None,
+            'n_groups': metadata.get('n_groups') if metadata else None
+        }
+        params = {k: (str(v) if v is not None else 'None') for k, v in params.items()}
+        mlflow.log_params(params)
 
         mlflow.log_metrics({
             'train_mae': gb_train_metrics['mae'],
@@ -580,6 +641,8 @@ def train_with_mlflow_manual_logging(X_train, X_val, X_test, y_train, y_val, y_t
 
         # Log GB tuning results and cv summary
         try:
+            if gb_grid is None:
+                raise ValueError("Gradient Boosting tuning did not run CV; skipping CV summary logging.")
             best_params = gb_grid.best_params_
             mlflow.log_params({'gb_best_'+k: str(v) for k, v in best_params.items()})
             cv_results = gb_grid.cv_results_
@@ -622,7 +685,7 @@ def train_with_mlflow_manual_logging(X_train, X_val, X_test, y_train, y_val, y_t
             pass
 
         try:
-            y_test_pred = gb_model.predict(X_test)
+            y_test_pred = gb_model.predict(X_test_c)
             residuals = y_test - y_test_pred
             fig, ax = plt.subplots(figsize=(6, 4))
             sns.scatterplot(x=y_test_pred, y=residuals, alpha=0.5)
@@ -683,25 +746,57 @@ def main():
     
     # Load data
     print("\n" + "=" * 80)
-    print("LOADING DAILY SALES FORECASTING DATA")
+    print("LOADING DEMAND DATA")
     print("=" * 80 + "\n")
 
-    # allow forcing aggregation via env var or CLI
-    import os, sys
-    force_agg = None
-    if os.environ.get('FORCE_AGG', '').lower() == 'daily':
-        force_agg = 'daily'
-    for i, a in enumerate(sys.argv[1:]):
-        if a in ('--force-agg',) and i + 2 <= len(sys.argv[1:]):
-            val = sys.argv[1:][i+1]
-            if val == 'daily':
-                force_agg = 'daily'
+    import os
+    import sys
 
-    X_train, X_val, X_test, y_train, y_val, y_test = load_preprocessed_data(force_aggregation=force_agg)
+    group_col = os.environ.get('GROUP_COL', 'Category')
+    group_value = os.environ.get('GROUP_VALUE')
+    target_col = os.environ.get('TARGET_COL', 'Qty')
+    min_group_size = int(os.environ.get('MIN_GROUP_SIZE', '30'))
+    csv_path = os.environ.get(
+        'DEMAND_CSV',
+        'Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv'
+    )
+
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == '--group-col' and i + 1 < len(args):
+            group_col = args[i + 1]
+        if a == '--group-value' and i + 1 < len(args):
+            group_value = args[i + 1]
+        if a == '--target-col' and i + 1 < len(args):
+            target_col = args[i + 1]
+        if a == '--min-group-size' and i + 1 < len(args):
+            min_group_size = int(args[i + 1])
+        if a == '--data-csv' and i + 1 < len(args):
+            csv_path = args[i + 1]
+
+    print(f"Group column: {group_col}")
+    print(f"Group value : {group_value if group_value else 'ALL'}")
+    print(f"Target col  : {target_col}")
+    print(f"CSV path    : {csv_path}")
+
+    X_train, X_val, X_test, y_train, y_val, y_test, group_map = prepare_train_data(
+        csv_path=csv_path,
+        group_col=group_col,
+        group_value=group_value,
+        target_col=target_col,
+        min_group_size=min_group_size
+    )
+
+    meta = {
+        'group_col': group_col,
+        'group_value': group_value,
+        'target_name': 'Daily_Demand',
+        'n_groups': len(group_map)
+    }
 
     # Train with hyperparameter tuning
     best_model, results = train_with_mlflow_manual_logging(
-        X_train, X_val, X_test, y_train, y_val, y_test
+        X_train, X_val, X_test, y_train, y_val, y_test, metadata=meta
     )
     
     print("\nKriteria 2 - Skilled Level (3 Poin) Complete!")
