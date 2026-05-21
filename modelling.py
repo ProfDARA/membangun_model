@@ -16,6 +16,68 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib
+
+# Use non-interactive backend for environments without display
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+def _save_fig(fig: matplotlib.figure.Figure, path: str):
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_actual_vs_pred(y_true, y_pred, out_path: str, title: str = 'Actual vs Predicted'):
+    if y_true is None or y_pred is None or len(y_true) == 0 or len(y_pred) == 0:
+        return
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sns.scatterplot(x=y_true, y=y_pred, alpha=0.6, ax=ax)
+    lims = [min(np.min(y_true), np.min(y_pred)), max(np.max(y_true), np.max(y_pred))]
+    ax.plot(lims, lims, '--', color='gray')
+    ax.set_xlabel('Actual')
+    ax.set_ylabel('Predicted')
+    ax.set_title(title)
+    _save_fig(fig, out_path)
+
+
+def plot_residuals(y_true, y_pred, out_path: str, title: str = 'Residuals'):
+    if y_true is None or y_pred is None or len(y_true) == 0 or len(y_pred) == 0:
+        return
+    res = np.asarray(y_true) - np.asarray(y_pred)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    sns.histplot(res, bins=40, kde=True, ax=axes[0])
+    axes[0].set_title('Residual distribution')
+    sns.scatterplot(x=y_pred, y=res, alpha=0.6, ax=axes[1])
+    axes[1].axhline(0, color='gray', linestyle='--')
+    axes[1].set_xlabel('Predicted')
+    axes[1].set_ylabel('Residual')
+    axes[1].set_title('Residuals vs Predicted')
+    fig.suptitle(title)
+    _save_fig(fig, out_path)
+
+
+def plot_feature_importances(model, feature_names, out_path: str, title: str = 'Feature Importances'):
+    try:
+        if not hasattr(model, 'feature_importances_'):
+            return
+        importances = np.array(model.feature_importances_)
+        if importances.sum() == 0:
+            return
+        idx = np.argsort(importances)[::-1]
+        top_n = min(20, len(importances))
+        fig, ax = plt.subplots(figsize=(8, max(3, top_n * 0.3)))
+        sns.barplot(x=importances[idx][:top_n], y=np.array(feature_names)[idx][:top_n], ax=ax)
+        ax.set_title(title)
+        ax.set_xlabel('Importance')
+        _save_fig(fig, out_path)
+    except Exception:
+        return
 
 
 def _resolve_csv_path(csv_path: str) -> Path:
