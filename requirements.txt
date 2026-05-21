@@ -8,3 +8,4 @@ cloudpickle>=2.0
 
 # Optional (only if using DagsHub/remote storage auth helpers)
 requests>=2.0
+dagshub>=0.3
