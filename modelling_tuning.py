@@ -1,5 +1,5 @@
 """
-Demand Forecasting with Hyperparameter Tuning - Kriteria 2: Skilled Level (3 Poin)
+Demand Forecasting with Hyperparameter Tuning
 Uses MLflow Tracking UI (local) with MANUAL logging (not autolog)
 Includes hyperparameter tuning and additional metrics
 Author: Danang Agung Restu Aji
@@ -26,19 +26,62 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
+def _feature_columns_for_frame(df: pd.DataFrame) -> list[str]:
+    base_features = [
+        'category_encoded',
+        'lag_1', 'lag_7',
+        'rolling_mean_7', 'rolling_std_7',
+        'day', 'month', 'weekday', 'is_weekend'
+    ]
+    feature_cols = [col for col in base_features if col in df.columns]
+    return feature_cols
+
+
+def _prepare_model_pair(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
+    Xc = _clean_X_for_model(X).reset_index(drop=True)
+    yc = pd.to_numeric(pd.Series(y).reset_index(drop=True), errors='coerce')
+    valid_mask = yc.notna()
+    Xc = Xc.loc[valid_mask].reset_index(drop=True)
+    yc = yc.loc[valid_mask].reset_index(drop=True)
+    return Xc, yc
+
+
+def _baseline_naive_prediction(X: pd.DataFrame) -> pd.Series:
+    if 'lag_1' not in X.columns:
+        raise KeyError('lag_1 feature not found for naive baseline prediction')
+    return pd.to_numeric(X['lag_1'], errors='coerce').fillna(0).reset_index(drop=True)
+
+
+def _export_feature_importance(model, feature_names, output_dir: str, prefix: str):
+    importances = getattr(model, 'feature_importances_', None)
+    if importances is None:
+        return None
+
+    importance_df = pd.DataFrame({
+        'feature': list(feature_names)[:len(importances)],
+        'importance': importances
+    }).sort_values('importance', ascending=False)
+
+    out_path = Path(output_dir) / f'{prefix}_feature_importance.csv'
+    importance_df.to_csv(out_path, index=False)
+    return out_path
+
+
 def _resolve_csv_path(csv_path: str) -> Path:
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parent
 
     def _resolve(p: str) -> Path:
-        p = Path(p)
-        return p if p.is_absolute() else (repo_root / p)
+        candidate = Path(p)
+        return candidate if candidate.is_absolute() else (repo_root / candidate)
 
     candidates = [
         _resolve(csv_path),
-        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv'),
-        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_demand_forecasting.csv'),
-        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_demand_by_sku.csv'),
-        _resolve('Eksperimen_SML_DanangAgungRestuAji/preprocessing/daily_demand_by_state.csv')
+        _resolve('amazon_preprocessing/daily_demand_forecasting.csv'),
+        _resolve('amazon_preprocessing/daily_demand_by_sku.csv'),
+        _resolve('amazon_preprocessing/daily_demand_by_state.csv'),
+        _resolve('daily_demand_forecasting.csv'),
+        _resolve('daily_demand_by_sku.csv'),
+        _resolve('daily_demand_by_state.csv')
     ]
 
     for p in candidates:
@@ -108,8 +151,9 @@ def build_grouped_demand_dataset(
     daily = (
         work.groupby([date_col, group_col], as_index=False)[target_col]
         .sum()
-        .rename(columns={target_col: 'Daily_Demand'})
     )
+    daily = cast(pd.DataFrame, daily)
+    daily.columns = [date_col, group_col, 'Daily_Demand']
 
     if fill_missing_dates:
         frames = []
@@ -130,34 +174,25 @@ def build_grouped_demand_dataset(
     if daily.empty:
         raise ValueError("No rows available after aggregation. Check group filters or min_group_size.")
 
-    daily = daily.sort_values([group_col, date_col])
+    daily = cast(pd.DataFrame, daily.sort_values([group_col, date_col]))
     daily['lag_1'] = daily.groupby(group_col)['Daily_Demand'].shift(1)
     daily['lag_7'] = daily.groupby(group_col)['Daily_Demand'].shift(7)
-    daily['lag_14'] = daily.groupby(group_col)['Daily_Demand'].shift(14)
     daily['rolling_mean_7'] = daily.groupby(group_col)['Daily_Demand'].transform(
         lambda s: s.shift(1).rolling(window=7).mean()
     )
     daily['rolling_std_7'] = daily.groupby(group_col)['Daily_Demand'].transform(
         lambda s: s.shift(1).rolling(window=7).std()
     )
-    daily['rolling_mean_30'] = daily.groupby(group_col)['Daily_Demand'].transform(
-        lambda s: s.shift(1).rolling(window=30).mean()
-    )
-    daily['rolling_std_30'] = daily.groupby(group_col)['Daily_Demand'].transform(
-        lambda s: s.shift(1).rolling(window=30).std()
-    )
 
     daily['day'] = daily[date_col].dt.day
     daily['month'] = daily[date_col].dt.month
-    daily['year'] = daily[date_col].dt.year
     daily['weekday'] = daily[date_col].dt.weekday
-    daily['weekofyear'] = daily[date_col].dt.isocalendar().week.astype(int)
     daily['is_weekend'] = (daily['weekday'] >= 5).astype(int)
 
     daily = daily.dropna().reset_index(drop=True)
 
     cat = daily[group_col].astype('category')
-    daily['group_id'] = cat.cat.codes
+    daily['category_encoded'] = cat.cat.codes
     group_mapping = {str(name): int(idx) for idx, name in enumerate(cat.cat.categories)}
 
     return daily, group_mapping
@@ -197,33 +232,35 @@ def prepare_train_data(
     fill_missing_dates: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series, Dict[str, int]]:
     df = load_sales_data(csv_path)
+    demand_target_col = 'Daily_Demand' if 'Daily_Demand' in df.columns else target_col
+    if demand_target_col not in df.columns:
+        if 'Qty' in df.columns:
+            demand_target_col = 'Qty'
+        else:
+            raise ValueError(
+                f"Missing target column: expected 'Daily_Demand', '{target_col}', or 'Qty'."
+            )
+
     dataset, group_mapping = build_grouped_demand_dataset(
         df,
         group_col=group_col,
         group_value=group_value,
         date_col=date_col,
-        target_col=target_col,
+        target_col=demand_target_col,
         min_group_size=min_group_size,
         fill_missing_dates=fill_missing_dates
     )
+    target_column = 'Daily_Demand'
 
     train_df, val_df, test_df = time_based_split(dataset, date_col=date_col)
-    include_group = dataset[group_col].nunique() > 1
-    feature_cols = [
-        'lag_1', 'lag_7', 'lag_14',
-        'rolling_mean_7', 'rolling_std_7',
-        'rolling_mean_30', 'rolling_std_30',
-        'day', 'month', 'year', 'weekday', 'weekofyear', 'is_weekend'
-    ]
-    if include_group:
-        feature_cols.append('group_id')
+    feature_cols = _feature_columns_for_frame(dataset)
 
     X_train = train_df[feature_cols]
-    y_train = train_df['Daily_Demand']
+    y_train = train_df[target_column]
     X_val = val_df[feature_cols]
-    y_val = val_df['Daily_Demand']
+    y_val = val_df[target_column]
     X_test = test_df[feature_cols]
-    y_test = test_df['Daily_Demand']
+    y_test = test_df[target_column]
 
     print(
         f"Prepared demand dataset: total={len(dataset)}, train={len(X_train)}, "
@@ -252,42 +289,6 @@ def _clean_X_for_model(X):
         Xc[col] = LabelEncoder().fit_transform(Xc[col].astype(str))
     Xc = Xc.fillna(0)
     return Xc
-
-
-def _prepare_tuning_data(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-) -> tuple[pd.DataFrame, pd.Series]:
-    """Clean tuning inputs and choose the largest non-empty training set available."""
-    X_train_c = _clean_X_for_model(X_train)
-    X_val_c = _clean_X_for_model(X_val)
-
-    if len(X_train_c) == 0 and len(X_val_c) == 0:
-        raise ValueError(
-            "No training rows available for hyperparameter tuning after feature cleaning. "
-            "Check the preprocessing output or the selected dataset path."
-        )
-
-    if len(X_val_c) == 0:
-        X_combined = X_train_c.reset_index(drop=True)
-        y_combined: pd.Series = pd.to_numeric(y_train, errors='coerce').reset_index(drop=True)
-    else:
-        X_combined = pd.concat([X_train_c, X_val_c], ignore_index=True)
-        y_combined = pd.concat([y_train, y_val], ignore_index=True)
-        y_combined = pd.to_numeric(y_combined, errors='coerce')
-
-    valid_mask = y_combined.notna()
-    X_combined = X_combined.loc[valid_mask].reset_index(drop=True)
-    y_combined = y_combined.loc[valid_mask].reset_index(drop=True)
-
-    if len(X_combined) == 0:
-        raise ValueError(
-            "Training targets became empty after numeric conversion. Check the target column values."
-        )
-
-    return X_combined, y_combined
 
 
 def evaluate_regression(y_true, y_pred, dataset_name: str = ""):
@@ -342,19 +343,21 @@ def hyperparameter_tuning_random_forest(X_train, y_train, X_val, y_val, X_test, 
     }
 
     rf_base = RandomForestRegressor(random_state=42, n_jobs=-1)
-    X_train_c = _clean_X_for_model(X_train)
-    X_test_c = _clean_X_for_model(X_test)
+    X_train_c, y_train_c = _prepare_model_pair(X_train, y_train)
+    X_val_c, y_val_c = _prepare_model_pair(X_val, y_val)
+    X_test_c, y_test_c = _prepare_model_pair(X_test, y_test)
 
-    X_combined, y_combined = _prepare_tuning_data(X_train, y_train, X_val, y_val)
-    cv_splits = min(3, len(X_combined) - 1)
+    cv_splits = min(3, len(X_train_c) - 1)
     if cv_splits < 2:
         print("Not enough rows for cross-validation; fitting Random Forest with default parameters instead.")
-        best_model = rf_base.fit(X_combined, y_combined)
+        best_model = rf_base.fit(X_train_c, y_train_c)
         y_train_pred = best_model.predict(X_train_c) if len(X_train_c) > 0 else np.array([])
+        y_val_pred = best_model.predict(X_val_c) if len(X_val_c) > 0 else np.array([])
         y_test_pred = best_model.predict(X_test_c) if len(X_test_c) > 0 else np.array([])
-        train_metrics = evaluate_regression(y_train, y_train_pred, "TRAINING - Tuned RF")
-        test_metrics = evaluate_regression(y_test, y_test_pred, "TEST - Tuned RF")
-        return best_model, None, train_metrics, test_metrics
+        train_metrics = evaluate_regression(y_train_c, y_train_pred, "TRAINING - Tuned RF")
+        val_metrics = evaluate_regression(y_val_c, y_val_pred, "VALIDATION - Tuned RF")
+        test_metrics = evaluate_regression(y_test_c, y_test_pred, "TEST - Tuned RF")
+        return best_model, None, train_metrics, val_metrics, test_metrics
 
     tscv = TimeSeriesSplit(n_splits=cv_splits)
 
@@ -364,7 +367,7 @@ def hyperparameter_tuning_random_forest(X_train, y_train, X_val, y_val, X_test, 
     )
 
     print("Running hyperparameter tuning (20 iterations)...")
-    grid_search.fit(X_combined, y_combined)
+    grid_search.fit(X_train_c, y_train_c)
 
     best_model = cast(RandomForestRegressor, grid_search.best_estimator_)
 
@@ -373,13 +376,15 @@ def hyperparameter_tuning_random_forest(X_train, y_train, X_val, y_val, X_test, 
 
     # Predictions
     y_train_pred = best_model.predict(X_train_c)
+    y_val_pred = best_model.predict(X_val_c)
     y_test_pred = best_model.predict(X_test_c)
 
     # Evaluate
-    train_metrics = evaluate_regression(y_train, y_train_pred, "TRAINING - Tuned RF")
-    test_metrics = evaluate_regression(y_test, y_test_pred, "TEST - Tuned RF")
+    train_metrics = evaluate_regression(y_train_c, y_train_pred, "TRAINING - Tuned RF")
+    val_metrics = evaluate_regression(y_val_c, y_val_pred, "VALIDATION - Tuned RF")
+    test_metrics = evaluate_regression(y_test_c, y_test_pred, "TEST - Tuned RF")
 
-    return best_model, grid_search, train_metrics, test_metrics
+    return best_model, grid_search, train_metrics, val_metrics, test_metrics
 
 
 def hyperparameter_tuning_gradient_boosting(X_train, y_train, X_val, y_val, X_test, y_test,
@@ -399,19 +404,21 @@ def hyperparameter_tuning_gradient_boosting(X_train, y_train, X_val, y_val, X_te
     }
 
     gb_base = GradientBoostingRegressor(random_state=42)
-    X_train_c = _clean_X_for_model(X_train)
-    X_test_c = _clean_X_for_model(X_test)
+    X_train_c, y_train_c = _prepare_model_pair(X_train, y_train)
+    X_val_c, y_val_c = _prepare_model_pair(X_val, y_val)
+    X_test_c, y_test_c = _prepare_model_pair(X_test, y_test)
 
-    X_combined, y_combined = _prepare_tuning_data(X_train, y_train, X_val, y_val)
-    cv_splits = min(3, len(X_combined) - 1)
+    cv_splits = min(3, len(X_train_c) - 1)
     if cv_splits < 2:
         print("Not enough rows for cross-validation; fitting Gradient Boosting with default parameters instead.")
-        best_model = gb_base.fit(X_combined, y_combined)
+        best_model = gb_base.fit(X_train_c, y_train_c)
         y_train_pred = best_model.predict(X_train_c) if len(X_train_c) > 0 else np.array([])
+        y_val_pred = best_model.predict(X_val_c) if len(X_val_c) > 0 else np.array([])
         y_test_pred = best_model.predict(X_test_c) if len(X_test_c) > 0 else np.array([])
-        train_metrics = evaluate_regression(y_train, y_train_pred, "TRAINING - Tuned GB")
-        test_metrics = evaluate_regression(y_test, y_test_pred, "TEST - Tuned GB")
-        return best_model, None, train_metrics, test_metrics
+        train_metrics = evaluate_regression(y_train_c, y_train_pred, "TRAINING - Tuned GB")
+        val_metrics = evaluate_regression(y_val_c, y_val_pred, "VALIDATION - Tuned GB")
+        test_metrics = evaluate_regression(y_test_c, y_test_pred, "TEST - Tuned GB")
+        return best_model, None, train_metrics, val_metrics, test_metrics
 
     tscv = TimeSeriesSplit(n_splits=cv_splits)
 
@@ -421,7 +428,7 @@ def hyperparameter_tuning_gradient_boosting(X_train, y_train, X_val, y_val, X_te
     )
 
     print("Running hyperparameter tuning (20 iterations)...")
-    grid_search.fit(X_combined, y_combined)
+    grid_search.fit(X_train_c, y_train_c)
 
     best_model = cast(GradientBoostingRegressor, grid_search.best_estimator_)
 
@@ -430,13 +437,15 @@ def hyperparameter_tuning_gradient_boosting(X_train, y_train, X_val, y_val, X_te
 
     # Predictions
     y_train_pred = best_model.predict(X_train_c)
+    y_val_pred = best_model.predict(X_val_c)
     y_test_pred = best_model.predict(X_test_c)
 
     # Evaluate
-    train_metrics = evaluate_regression(y_train, y_train_pred, "TRAINING - Tuned GB")
-    test_metrics = evaluate_regression(y_test, y_test_pred, "TEST - Tuned GB")
+    train_metrics = evaluate_regression(y_train_c, y_train_pred, "TRAINING - Tuned GB")
+    val_metrics = evaluate_regression(y_val_c, y_val_pred, "VALIDATION - Tuned GB")
+    test_metrics = evaluate_regression(y_test_c, y_test_pred, "TEST - Tuned GB")
 
-    return best_model, grid_search, train_metrics, test_metrics
+    return best_model, grid_search, train_metrics, val_metrics, test_metrics
 
 
 def train_with_mlflow_manual_logging(
@@ -480,6 +489,7 @@ def train_with_mlflow_manual_logging(
     print("=" * 80 + "\n")
     
     results = {}
+    baseline_results = {}
 
     # Basic diagnostics on target distributions and sample data
     def _stats(s):
@@ -492,6 +502,8 @@ def train_with_mlflow_manual_logging(
     print(f"Target stats - train mean={tr['mean']:.2f}, val mean={va['mean']:.2f}, test mean={te['mean']:.2f}")
     if tr['mean'] != 0 and (abs(tr['mean'] - va['mean']) / (abs(tr['mean']) + 1e-9) > 0.5 or abs(tr['mean'] - te['mean']) / (abs(tr['mean']) + 1e-9) > 0.5):
         print("WARNING: Large shift between train and validation/test target means (>50%). Check whether splits mix per-order and aggregated (daily/monthly) targets.")
+    if 'category_encoded' in X_train.columns:
+        print(f"Detected category-encoded per-category setup with {metadata.get('n_groups') if metadata else 'unknown'} groups.")
 
     # show small samples and dtypes for quick inspection
     try:
@@ -506,11 +518,17 @@ def train_with_mlflow_manual_logging(
     # ========== RANDOM FOREST TUNING ==========
     with mlflow.start_run(run_name="rf_tuned"):
         X_test_c = _clean_X_for_model(X_test)
-        rf_model, rf_grid, rf_train_metrics, rf_test_metrics = hyperparameter_tuning_random_forest(
+        rf_model, rf_grid, rf_train_metrics, rf_val_metrics, rf_test_metrics = hyperparameter_tuning_random_forest(
             X_train, y_train, X_val, y_val, X_test, y_test, output_dir
         )
 
-        # MANUAL LOGGING (instead of autolog)
+        rf_naive_val_metrics = evaluate_regression(y_val, _baseline_naive_prediction(X_val), "VALIDATION - Naive Baseline")
+        rf_naive_test_metrics = evaluate_regression(y_test, _baseline_naive_prediction(X_test), "TEST - Naive Baseline")
+        baseline_results['rf_naive'] = {
+            'val_rmse': rf_naive_val_metrics['rmse'],
+            'test_rmse': rf_naive_test_metrics['rmse']
+        }
+
         params = {
             'model_type': 'RandomForestRegressor',
             'n_estimators': int(getattr(rf_model, 'n_estimators', 0)),
@@ -523,15 +541,12 @@ def train_with_mlflow_manual_logging(
         params = {k: (str(v) if v is not None else 'None') for k, v in params.items()}
         mlflow.log_params(params)
 
-        # Log tuning results (best params + compact cv summary)
         try:
             if rf_grid is None:
-                raise ValueError("Random Forest tuning did not run CV; skipping CV summary logging.")
+                raise ValueError('Random Forest tuning did not run CV; skipping CV summary logging.')
             best_params = rf_grid.best_params_
-            mlflow.log_params({'rf_best_'+k: str(v) for k, v in best_params.items()})
-            # Create compact CV results summary
+            mlflow.log_params({'rf_best_' + k: str(v) for k, v in best_params.items()})
             cv_results = rf_grid.cv_results_
-            # extract top 3 by rank_test_score
             top_idx = sorted(range(len(cv_results['rank_test_score'])), key=lambda i: cv_results['rank_test_score'][i])[:3]
             cv_summary = []
             for i in top_idx:
@@ -548,31 +563,42 @@ def train_with_mlflow_manual_logging(
         except Exception:
             pass
 
-        # Log regression metrics
         mlflow.log_metrics({
             'train_mae': rf_train_metrics['mae'],
             'train_rmse': rf_train_metrics['rmse'],
             'train_r2': rf_train_metrics['r2'],
             'train_mape_pct': rf_train_metrics['mape_pct'],
+            'val_mae': rf_val_metrics['mae'],
+            'val_rmse': rf_val_metrics['rmse'],
+            'val_r2': rf_val_metrics['r2'],
+            'val_mape_pct': rf_val_metrics['mape_pct'],
             'test_mae': rf_test_metrics['mae'],
             'test_rmse': rf_test_metrics['rmse'],
             'test_r2': rf_test_metrics['r2'],
-            'test_mape_pct': rf_test_metrics['mape_pct']
+            'test_mape_pct': rf_test_metrics['mape_pct'],
+            'baseline_val_rmse': rf_naive_val_metrics['rmse'],
+            'baseline_test_rmse': rf_naive_test_metrics['rmse']
         })
 
-        # Save model
         model_path = f'{output_dir}/rf_tuned_model.pkl'
         with open(model_path, 'wb') as f:
             pickle.dump(rf_model, f)
         mlflow.log_artifact(model_path)
 
-        # Additional artefak untuk Skilled: feature importances + residuals
         try:
+            feat_names = list(_clean_X_for_model(X_train).columns)
+            fi_csv = _export_feature_importance(rf_model, feat_names, output_dir, 'rf')
+            if fi_csv is not None:
+                mlflow.log_artifact(str(fi_csv))
+
             importances = getattr(rf_model, 'feature_importances_', None)
             if importances is not None:
-                feat_names = list(_clean_X_for_model(X_train).columns)
-                fig, ax = plt.subplots(figsize=(8, max(3, len(feat_names) * 0.3)))
-                sns.barplot(x=importances, y=feat_names, ax=ax)
+                importance_df = pd.DataFrame({
+                    'feature': feat_names[:len(importances)],
+                    'importance': importances
+                }).sort_values('importance', ascending=False)
+                fig, ax = plt.subplots(figsize=(8, max(3, len(importance_df) * 0.3)))
+                sns.barplot(x='importance', y='feature', data=importance_df, ax=ax)
                 ax.set_title('RF Feature Importances')
                 fig.tight_layout()
                 fi_path = Path(output_dir) / 'rf_feature_importances.png'
@@ -601,9 +627,11 @@ def train_with_mlflow_manual_logging(
 
         results['rf_tuned'] = {
             'model': rf_model,
+            'val_rmse': rf_val_metrics['rmse'],
             'test_rmse': rf_test_metrics['rmse'],
             'metrics': {
                 'train': rf_train_metrics,
+                'val': rf_val_metrics,
                 'test': rf_test_metrics
             }
         }
@@ -611,11 +639,17 @@ def train_with_mlflow_manual_logging(
     # ========== GRADIENT BOOSTING TUNING ==========
     with mlflow.start_run(run_name="gb_tuned"):
         X_test_c = _clean_X_for_model(X_test)
-        gb_model, gb_grid, gb_train_metrics, gb_test_metrics = hyperparameter_tuning_gradient_boosting(
+        gb_model, gb_grid, gb_train_metrics, gb_val_metrics, gb_test_metrics = hyperparameter_tuning_gradient_boosting(
             X_train, y_train, X_val, y_val, X_test, y_test, output_dir
         )
 
-        # MANUAL LOGGING
+        gb_naive_val_metrics = evaluate_regression(y_val, _baseline_naive_prediction(X_val), "VALIDATION - Naive Baseline")
+        gb_naive_test_metrics = evaluate_regression(y_test, _baseline_naive_prediction(X_test), "TEST - Naive Baseline")
+        baseline_results['gb_naive'] = {
+            'val_rmse': gb_naive_val_metrics['rmse'],
+            'test_rmse': gb_naive_test_metrics['rmse']
+        }
+
         params = {
             'model_type': 'GradientBoostingRegressor',
             'n_estimators': int(getattr(gb_model, 'n_estimators', 0)),
@@ -633,18 +667,23 @@ def train_with_mlflow_manual_logging(
             'train_rmse': gb_train_metrics['rmse'],
             'train_r2': gb_train_metrics['r2'],
             'train_mape_pct': gb_train_metrics['mape_pct'],
+            'val_mae': gb_val_metrics['mae'],
+            'val_rmse': gb_val_metrics['rmse'],
+            'val_r2': gb_val_metrics['r2'],
+            'val_mape_pct': gb_val_metrics['mape_pct'],
             'test_mae': gb_test_metrics['mae'],
             'test_rmse': gb_test_metrics['rmse'],
             'test_r2': gb_test_metrics['r2'],
-            'test_mape_pct': gb_test_metrics['mape_pct']
+            'test_mape_pct': gb_test_metrics['mape_pct'],
+            'baseline_val_rmse': gb_naive_val_metrics['rmse'],
+            'baseline_test_rmse': gb_naive_test_metrics['rmse']
         })
 
-        # Log GB tuning results and cv summary
         try:
             if gb_grid is None:
-                raise ValueError("Gradient Boosting tuning did not run CV; skipping CV summary logging.")
+                raise ValueError('Gradient Boosting tuning did not run CV; skipping CV summary logging.')
             best_params = gb_grid.best_params_
-            mlflow.log_params({'gb_best_'+k: str(v) for k, v in best_params.items()})
+            mlflow.log_params({'gb_best_' + k: str(v) for k, v in best_params.items()})
             cv_results = gb_grid.cv_results_
             top_idx = sorted(range(len(cv_results['rank_test_score'])), key=lambda i: cv_results['rank_test_score'][i])[:3]
             cv_summary = []
@@ -662,19 +701,25 @@ def train_with_mlflow_manual_logging(
         except Exception:
             pass
 
-        # Save model
         model_path = f'{output_dir}/gb_tuned_model.pkl'
         with open(model_path, 'wb') as f:
             pickle.dump(gb_model, f)
         mlflow.log_artifact(model_path)
 
-        # Additional artefak: feature importances + residuals for GB
         try:
+            feat_names = list(_clean_X_for_model(X_train).columns)
+            fi_csv = _export_feature_importance(gb_model, feat_names, output_dir, 'gb')
+            if fi_csv is not None:
+                mlflow.log_artifact(str(fi_csv))
+
             importances = getattr(gb_model, 'feature_importances_', None)
             if importances is not None:
-                feat_names = list(_clean_X_for_model(X_train).columns)
-                fig, ax = plt.subplots(figsize=(8, max(3, len(feat_names) * 0.3)))
-                sns.barplot(x=importances, y=feat_names, ax=ax)
+                importance_df = pd.DataFrame({
+                    'feature': feat_names[:len(importances)],
+                    'importance': importances
+                }).sort_values('importance', ascending=False)
+                fig, ax = plt.subplots(figsize=(8, max(3, len(importance_df) * 0.3)))
+                sns.barplot(x='importance', y='feature', data=importance_df, ax=ax)
                 ax.set_title('GB Feature Importances')
                 fig.tight_layout()
                 fi_path = Path(output_dir) / 'gb_feature_importances.png'
@@ -703,9 +748,11 @@ def train_with_mlflow_manual_logging(
 
         results['gb_tuned'] = {
             'model': gb_model,
+            'val_rmse': gb_val_metrics['rmse'],
             'test_rmse': gb_test_metrics['rmse'],
             'metrics': {
                 'train': gb_train_metrics,
+                'val': gb_val_metrics,
                 'test': gb_test_metrics
             }
         }
@@ -721,16 +768,24 @@ def train_with_mlflow_manual_logging(
 
     for model_name, result in results.items():
         print(f"\n{model_name}:")
+        print(f"  Validation RMSE: {result['val_rmse']:.4f}")
         print(f"  Test RMSE: {result['test_rmse']:.4f}")
 
-        if result['test_rmse'] < best_rmse:
-            best_rmse = result['test_rmse']
+        if result['val_rmse'] < best_rmse:
+            best_rmse = result['val_rmse']
             best_model = result['model']
             best_name = model_name
 
     print(f"\n{'=' * 80}")
-    print(f"Best Tuned Model: {best_name} (RMSE: {best_rmse:.4f})")
+    print(f"Best Tuned Model: {best_name} (Validation RMSE: {best_rmse:.4f})")
     print(f"{'=' * 80}\n")
+
+    if baseline_results:
+        naive_val_rmse = min(v['val_rmse'] for v in baseline_results.values())
+        naive_test_rmse = min(v['test_rmse'] for v in baseline_results.values())
+        print(f"Naive Baseline RMSE - Validation: {naive_val_rmse:.4f}, Test: {naive_test_rmse:.4f}")
+        if best_rmse > naive_val_rmse:
+            print("WARNING: Selected model is worse than the naive baseline on validation RMSE.")
 
     # Save best model
     best_model_path = f'{output_dir}/best_tuned_model.pkl'
@@ -754,11 +809,11 @@ def main():
 
     group_col = os.environ.get('GROUP_COL', 'Category')
     group_value = os.environ.get('GROUP_VALUE')
-    target_col = os.environ.get('TARGET_COL', 'Qty')
+    target_col = os.environ.get('TARGET_COL', 'Daily_Demand')
     min_group_size = int(os.environ.get('MIN_GROUP_SIZE', '30'))
     csv_path = os.environ.get(
         'DEMAND_CSV',
-        'Eksperimen_SML_DanangAgungRestuAji/preprocessing/cleaned_amazon_sales.csv'
+        'amazon_preprocessing/daily_demand_forecasting.csv'
     )
 
     args = sys.argv[1:]
@@ -799,7 +854,6 @@ def main():
         X_train, X_val, X_test, y_train, y_val, y_test, metadata=meta
     )
     
-    print("\nKriteria 2 - Skilled Level (3 Poin) Complete!")
     print("Features:")
     print("  - Hyperparameter tuning dengan RandomizedSearchCV")
     print("  - Manual logging di MLflow (tidak autolog)")
@@ -810,3 +864,20 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def load_preprocessed_data(force_aggregation=None):
+    csv_path = os.environ.get('DEMAND_CSV', 'amazon_preprocessing/daily_demand_forecasting.csv')
+    group_col = os.environ.get('GROUP_COL', 'Category')
+    group_value = os.environ.get('GROUP_VALUE')
+    target_col = os.environ.get('TARGET_COL', 'Daily_Demand')
+    min_group_size = int(os.environ.get('MIN_GROUP_SIZE', '30'))
+
+    X_train, X_val, X_test, y_train, y_val, y_test, _ = prepare_train_data(
+        csv_path=csv_path,
+        group_col=group_col,
+        group_value=group_value,
+        target_col=target_col,
+        min_group_size=min_group_size
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
