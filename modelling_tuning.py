@@ -13,10 +13,6 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import LabelEncoder
 import mlflow
 import mlflow.sklearn
-try:
-    import dagshub
-except Exception:
-    dagshub = None
 import pickle
 import os
 import json
@@ -24,6 +20,13 @@ from pathlib import Path
 from typing import cast, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.metrics import confusion_matrix
+from sklearn.utils import estimator_html_repr
+
+try:
+    import dagshub
+except ImportError:
+    dagshub = None
 
 
 def _feature_columns_for_frame(df: pd.DataFrame) -> list[str]:
@@ -325,6 +328,93 @@ def evaluate_regression(y_true, y_pred, dataset_name: str = ""):
     return metrics
 
 
+def _get_local_tracking_uri() -> str:
+    repo_root = Path(__file__).resolve().parent
+    tracking_dir = repo_root / 'mlruns'
+    tracking_dir.mkdir(parents=True, exist_ok=True)
+    return os.environ.get('MLFLOW_TRACKING_URI', f'file:///{tracking_dir.as_posix()}')
+
+
+def _configure_mlflow_tracking() -> str:
+    repo_owner = os.environ.get('DAGSHUB_REPO_OWNER')
+    repo_name = os.environ.get('DAGSHUB_REPO_NAME')
+
+    if repo_owner and repo_name:
+        if dagshub is None:
+            print('DagsHub environment variables are set, but dagshub is not installed. Falling back to local MLflow tracking.')
+            return _get_local_tracking_uri()
+
+        dagshub.init(repo_owner=repo_owner, repo_name=repo_name, mlflow=True)
+        tracking_uri = os.environ.get('MLFLOW_TRACKING_URI')
+        if tracking_uri:
+            return tracking_uri
+
+        return mlflow.get_tracking_uri()
+
+    return _get_local_tracking_uri()
+
+
+def _save_training_confusion_matrix(y_true, y_pred, output_path: Path, bins: int = 5) -> Path:
+    y_true_arr = pd.to_numeric(pd.Series(y_true), errors='coerce').fillna(0).to_numpy()
+    y_pred_arr = pd.to_numeric(pd.Series(y_pred), errors='coerce').fillna(0).to_numpy()
+
+    if len(y_true_arr) == 0:
+        raise ValueError('Cannot create confusion matrix with empty targets.')
+
+    combined = np.concatenate([y_true_arr, y_pred_arr])
+    unique_values = np.unique(combined)
+
+    if len(unique_values) <= bins:
+        labels = list(range(len(unique_values)))
+        mapping = {value: idx for idx, value in enumerate(unique_values)}
+        true_binned = np.array([mapping[value] for value in y_true_arr])
+        pred_binned = np.array([mapping[min(unique_values, key=lambda candidate: abs(candidate - value))] for value in y_pred_arr])
+    else:
+        quantiles = np.linspace(0, 1, bins + 1)
+        edges = np.unique(np.quantile(combined, quantiles))
+        if len(edges) < 3:
+            edges = np.linspace(float(np.min(combined)), float(np.max(combined)), bins + 1)
+        edges = np.asarray(edges, dtype=float)
+        edges[0] = edges[0] - 1e-9
+        edges[-1] = edges[-1] + 1e-9
+        true_binned = np.digitize(y_true_arr, edges[1:-1], right=True)
+        pred_binned = np.digitize(y_pred_arr, edges[1:-1], right=True)
+        labels = [f'B{i + 1}' for i in range(len(edges) - 1)]
+
+    cm = confusion_matrix(true_binned, pred_binned, labels=list(range(len(labels))))
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels, ax=ax)
+    ax.set_xlabel('Predicted bin')
+    ax.set_ylabel('Actual bin')
+    ax.set_title('Training Confusion Matrix')
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    return output_path
+
+
+def _write_metric_info(output_dir: Path, model_name: str, params: Dict[str, object], metrics: Dict[str, Dict[str, float]], extra: Optional[Dict[str, object]] = None) -> Path:
+    payload = {
+        'model_name': model_name,
+        'params': params,
+        'metrics': metrics,
+    }
+    if extra:
+        payload.update(extra)
+
+    output_path = output_dir / 'metric_info.json'
+    with open(output_path, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, indent=2)
+    return output_path
+
+
+def _write_estimator_html(model, output_dir: Path) -> Path:
+    html_path = output_dir / 'estimator.html'
+    html_path.write_text(estimator_html_repr(model), encoding='utf-8')
+    return html_path
+
+
 def hyperparameter_tuning_random_forest(X_train, y_train, X_val, y_val, X_test, y_test,
                                         output_dir: str = 'Membangun_model/artifacts'):
     """
@@ -460,7 +550,7 @@ def train_with_mlflow_manual_logging(
 ):
     """
     Train models with MLflow manual logging (NOT autolog)
-    Includes hyperparameter tuning for Skilled level (3 poin)
+    Includes hyperparameter tuning for Random Forest and Gradient Boosting, with comprehensive metric logging and artifact saving.
     
     Args:
         X_train, X_val, X_test: Feature sets
@@ -470,21 +560,12 @@ def train_with_mlflow_manual_logging(
     
     os.makedirs(output_dir, exist_ok=True)
 
-    # Inisialisasi Dagshub untuk MLflow tracking
-    try:
-        if dagshub is not None:
-            dagshub.init(repo_owner='ProfDARA', repo_name='membangun_model', mlflow=True)
-            print('dagshub.init called — MLflow will log to DagsHub')
-    except Exception as e:
-        print(f"dagshub.init skipped: {e}")
-
-    # Set MLflow tracking URI to DagsHub
-    mlflow.set_tracking_uri("https://dagshub.com/ProfDARA/membangun_model.mlflow")
+    tracking_uri = _configure_mlflow_tracking()
+    mlflow.set_tracking_uri(tracking_uri)
     group_col = metadata.get('group_col') if metadata else 'Group'
     mlflow.set_experiment(f"Amazon_Demand_Forecasting_Tuning_{group_col}")
     
     print("\n" + "=" * 80)
-    print("KRITERIA 2: MODEL BUILDING - SKILLED LEVEL (3 Poin)")
     print("MLflow Manual Logging with Hyperparameter Tuning")
     print("=" * 80 + "\n")
     
@@ -584,6 +665,33 @@ def train_with_mlflow_manual_logging(
         with open(model_path, 'wb') as f:
             pickle.dump(rf_model, f)
         mlflow.log_artifact(model_path)
+
+        estimator_html_path = _write_estimator_html(rf_model, Path(output_dir))
+        mlflow.log_artifact(str(estimator_html_path))
+
+        rf_train_pred = rf_model.predict(_clean_X_for_model(X_train))
+        confusion_path = _save_training_confusion_matrix(y_train, rf_train_pred, Path(output_dir) / 'training_confusion_matrix.png')
+        mlflow.log_artifact(str(confusion_path))
+
+        metric_info_path = _write_metric_info(
+            Path(output_dir),
+            'RandomForestRegressor',
+            params,
+            {
+                'train': rf_train_metrics,
+                'val': rf_val_metrics,
+                'test': rf_test_metrics,
+                'baseline_val': rf_naive_val_metrics,
+                'baseline_test': rf_naive_test_metrics,
+            },
+            extra={
+                'best_params': rf_grid.best_params_ if rf_grid is not None else None,
+                'tracking_uri': tracking_uri,
+            }
+        )
+        mlflow.log_artifact(str(metric_info_path))
+
+        mlflow.sklearn.log_model(rf_model, artifact_path='model')
 
         try:
             feat_names = list(_clean_X_for_model(X_train).columns)
@@ -705,6 +813,33 @@ def train_with_mlflow_manual_logging(
         with open(model_path, 'wb') as f:
             pickle.dump(gb_model, f)
         mlflow.log_artifact(model_path)
+
+        estimator_html_path = _write_estimator_html(gb_model, Path(output_dir))
+        mlflow.log_artifact(str(estimator_html_path))
+
+        gb_train_pred = gb_model.predict(_clean_X_for_model(X_train))
+        confusion_path = _save_training_confusion_matrix(y_train, gb_train_pred, Path(output_dir) / 'training_confusion_matrix.png')
+        mlflow.log_artifact(str(confusion_path))
+
+        metric_info_path = _write_metric_info(
+            Path(output_dir),
+            'GradientBoostingRegressor',
+            params,
+            {
+                'train': gb_train_metrics,
+                'val': gb_val_metrics,
+                'test': gb_test_metrics,
+                'baseline_val': gb_naive_val_metrics,
+                'baseline_test': gb_naive_test_metrics,
+            },
+            extra={
+                'best_params': gb_grid.best_params_ if gb_grid is not None else None,
+                'tracking_uri': tracking_uri,
+            }
+        )
+        mlflow.log_artifact(str(metric_info_path))
+
+        mlflow.sklearn.log_model(gb_model, artifact_path='model')
 
         try:
             feat_names = list(_clean_X_for_model(X_train).columns)
