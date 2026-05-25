@@ -555,17 +555,17 @@ def train_with_mlflow_manual_logging(
     Args:
         X_train, X_val, X_test: Feature sets
         y_train, y_val, y_test: Target sets
-        output_dir: Directory to save models
     """
-    
-    os.makedirs(output_dir, exist_ok=True)
 
-    tracking_uri = _configure_mlflow_tracking()
+    # Konfigurasi DagsHub dibuat eksplisit seperti versi yang lama.
+    # Ini mencegah fallback ke tracking lokal.
+    if dagshub is None:
+        raise ImportError('dagshub package is required for DagsHub tracking')
+
+    tracking_uri = 'https://dagshub.com/ProfDARA/membangun_model.mlflow'
+    dagshub.init(repo_owner='ProfDARA', repo_name='membangun_model', mlflow=True)
     mlflow.set_tracking_uri(tracking_uri)
-    group_col = metadata.get('group_col') if metadata else 'Group'
-    mlflow.set_experiment(f"Amazon_Demand_Forecasting_Tuning_{group_col}")
-    
-    print("\n" + "=" * 80)
+    print(f'Using DagsHub MLflow tracking: {tracking_uri}')
     print("MLflow Manual Logging with Hyperparameter Tuning")
     print("=" * 80 + "\n")
     
